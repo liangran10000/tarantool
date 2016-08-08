@@ -4444,7 +4444,6 @@ vy_run_free(struct vy_run *b)
 #define SI_REVOKE     16
 #define SI_RDB        32
 #define SI_RDB_DBI    64
-#define SI_RDB_DBSEAL 128
 #define SI_RDB_UNDEF  256
 #define SI_RDB_REMOVE 512
 
@@ -4455,7 +4454,6 @@ static int
 vy_range_create(struct vy_range*, struct vy_index_conf*, struct sdid*);
 static int vy_range_free(struct vy_range*, struct vy_env*, int);
 static int vy_range_gc_index(struct vy_env*, struct svindex*);
-static int vy_range_seal(struct vy_range*, struct vy_index_conf*);
 static int vy_range_complete(struct vy_range*, struct vy_index_conf*);
 
 static inline void
@@ -5931,23 +5929,6 @@ si_merge(struct vy_index *index, struct sdc *c, struct vy_range *range,
 
 	/* compaction completion */
 
-	/* seal nodes */
-	vy_bufiter_open(&i, result, sizeof(struct vy_range*));
-	while (vy_bufiter_has(&i))
-	{
-		n  = vy_bufiterref_get(&i);
-		rc = vy_range_seal(n, &index->conf);
-		if (unlikely(rc == -1)) {
-			vy_range_free(range, env, 0);
-			return -1;
-		}
-		VINYL_INJECTION(r->i, VINYL_INJECTION_SI_COMPACTION_3,
-		             vy_range_free(range, env, 0);
-		             vy_error("%s", "error injection");
-		             return -1);
-		vy_bufiter_next(&i);
-	}
-
 	VINYL_INJECTION(r->i, VINYL_INJECTION_SI_COMPACTION_1,
 	             vy_range_free(range, env, 0);
 	             vy_error("%s", "error injection");
@@ -6167,32 +6148,6 @@ static int vy_range_free(struct vy_range *n, struct vy_env *env, int gc)
 		rcret = -1;
 	free(n);
 	return rcret;
-}
-
-static int vy_range_seal(struct vy_range *n, struct vy_index_conf *scheme)
-{
-	int rc;
-	if (scheme->sync) {
-		rc = vy_file_sync(&n->file);
-		if (unlikely(rc == -1)) {
-			vy_error("index file '%s' sync error: %s",
-			               n->file.path,
-			               strerror(errno));
-			return -1;
-		}
-	}
-	char path[PATH_MAX];
-	vy_path_compound(path, scheme->path,
-	                n->self.id.parent, n->self.id.id,
-	                ".index.seal");
-	rc = vy_file_rename(&n->file, path);
-	if (unlikely(rc == -1)) {
-		vy_error("index file '%s' rename error: %s",
-		               n->file.path,
-		               strerror(errno));
-		return -1;
-	}
-	return 0;
 }
 
 static int
@@ -6831,33 +6786,6 @@ si_readcommited(struct vy_index *index, struct vy_tuple *tuple)
 	return 0;
 }
 
-/*
-	repository recover states
-	-------------------------
-
-	compaction
-
-	000000001.000000002.index.incomplete  (1)
-	000000001.000000002.index.seal        (2)
-	000000002.index                       (3)
-	000000001.000000003.index.incomplete
-	000000001.000000003.index.seal
-	000000003.index
-	(4)
-
-	1. remove incomplete, mark parent as having incomplete
-	2. find parent, mark as having seal
-	3. add
-	4. recover:
-		a. if parent has incomplete and seal - remove both
-		b. if parent has incomplete - remove incomplete
-		c. if parent has seal - remove parent, complete seal
-
-	see: snapshot recover
-	see: key_def recover
-	see: test/crash/durability.test.c
-*/
-
 static struct vy_range *
 si_bootstrap(struct vy_index *index, uint64_t parent)
 {
@@ -6956,7 +6884,6 @@ si_process(char *name, uint64_t *nsn, uint64_t *parent)
 {
 	/* id.index */
 	/* id.id.index.incomplete */
-	/* id.id.index.seal */
 	/* id.id.index.gc */
 	char *token = name;
 	int64_t id = si_processid(&token);
@@ -6979,8 +6906,6 @@ si_process(char *name, uint64_t *nsn, uint64_t *parent)
 	if (strcmp(token, ".index.incomplete") == 0)
 		return SI_RDB_DBI;
 	else
-	if (strcmp(token, ".index.seal") == 0)
-		return SI_RDB_DBSEAL;
 	return -1;
 }
 
@@ -7008,8 +6933,7 @@ si_trackdir(struct sitrack *track, struct vy_env *env, struct vy_index *i)
 		struct vy_range *head, *node;
 		char path[PATH_MAX];
 		switch (rc) {
-		case SI_RDB_DBI:
-		case SI_RDB_DBSEAL: {
+		case SI_RDB_DBI: {
 			/* find parent node and mark it as having
 			 * incomplete compaction process */
 			head = si_trackget(track, id_parent);
@@ -7023,32 +6947,14 @@ si_trackdir(struct sitrack *track, struct vy_env *env, struct vy_index *i)
 			}
 			head->recover |= rc;
 			/* remove any incomplete file made during compaction */
-			if (rc == SI_RDB_DBI) {
-				vy_path_compound(path, i->conf.path, id_parent, id,
-				                ".index.incomplete");
-				rc = unlink(path);
-				if (unlikely(rc == -1)) {
-					vy_error("index file '%s' unlink error: %s",
-						 path, strerror(errno));
-					goto error;
-				}
-				continue;
-			}
-			assert(rc == SI_RDB_DBSEAL);
-			/* recover 'sealed' node */
-			node = vy_range_new(i->key_def);
-			if (unlikely(node == NULL))
-				goto error;
-			node->recover = SI_RDB_DBSEAL;
 			vy_path_compound(path, i->conf.path, id_parent, id,
-			                ".index.seal");
-			rc = vy_range_open(node, env, path);
+			                ".index.incomplete");
+			rc = unlink(path);
 			if (unlikely(rc == -1)) {
-				vy_range_free(node, env, 0);
+				vy_error("index file '%s' unlink error: %s",
+					 path, strerror(errno));
 				goto error;
 			}
-			si_trackset(track, node);
-			si_trackmetrics(track, node);
 			continue;
 		}
 		case SI_RDB_REMOVE:
@@ -7108,38 +7014,16 @@ si_trackvalidate(struct sitrack *track, struct vy_buf *buf, struct vy_index *i)
 	struct vy_range *n = vy_range_id_tree_last(&track->tree);
 	while (n) {
 		switch (n->recover) {
-		case SI_RDB|SI_RDB_DBI|SI_RDB_DBSEAL|SI_RDB_REMOVE:
-		case SI_RDB|SI_RDB_DBSEAL|SI_RDB_REMOVE:
+		case SI_RDB|SI_RDB_DBI|SI_RDB_REMOVE:
 		case SI_RDB|SI_RDB_REMOVE:
-		case SI_RDB_UNDEF|SI_RDB_DBSEAL|SI_RDB_REMOVE:
-		case SI_RDB|SI_RDB_DBI|SI_RDB_DBSEAL:
+		case SI_RDB_UNDEF|SI_RDB_REMOVE:
 		case SI_RDB|SI_RDB_DBI:
 		case SI_RDB:
-		case SI_RDB|SI_RDB_DBSEAL:
-		case SI_RDB_UNDEF|SI_RDB_DBSEAL: {
+		case SI_RDB_UNDEF: {
 			/* match and remove any leftover ancestor */
 			struct vy_range *ancestor = si_trackget(track, n->self.id.parent);
 			if (ancestor && (ancestor != n))
 				ancestor->recover |= SI_RDB_REMOVE;
-			break;
-		}
-		case SI_RDB_DBSEAL: {
-			/* find parent */
-			struct vy_range *parent = si_trackget(track, n->self.id.parent);
-			if (parent) {
-				/* schedule node for removal, if has incomplete merges */
-				if (parent->recover & SI_RDB_DBI)
-					n->recover |= SI_RDB_REMOVE;
-				else
-					parent->recover |= SI_RDB_REMOVE;
-			}
-			if (! (n->recover & SI_RDB_REMOVE)) {
-				/* complete node */
-				int rc = vy_range_complete(n, &i->conf);
-				if (unlikely(rc == -1))
-					return -1;
-				n->recover = SI_RDB;
-			}
 			break;
 		}
 		default:
